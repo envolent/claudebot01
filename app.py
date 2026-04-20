@@ -12,7 +12,26 @@ app = Flask(__name__)
 DB_PATH = os.environ.get('DB_PATH', 'trading.db')
 STARTING_BALANCE = 10000.0
 
-WATCHLIST = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'AMD', 'NFLX', 'SPY']
+WATCHLIST = [
+    # Mega-cap tech
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA',
+    # Mid-cap tech & semis
+    'AMD', 'INTC', 'QCOM', 'ADBE', 'CRM', 'ORCL', 'NFLX',
+    # Finance
+    'JPM', 'BAC', 'GS', 'V', 'MA',
+    # Healthcare
+    'JNJ', 'UNH', 'PFE', 'ABBV', 'MRK',
+    # Consumer
+    'WMT', 'COST', 'MCD', 'SBUX', 'NKE',
+    # Energy
+    'XOM', 'CVX',
+    # Industrial
+    'CAT', 'BA', 'HON',
+    # ETFs (broad market)
+    'SPY', 'QQQ', 'IWM',
+]
+
+APPROVED_SYMBOLS = set(WATCHLIST)
 
 STRATEGIES = {
     'ultra_safe':       {'interval': 120, 'position_pct': 0.02, 'max_pos': 3,  'threshold': 0.025, 'label': 'Ultra Safe'},
@@ -376,6 +395,11 @@ def api_prices():
     return jsonify({s: round(get_price(s), 2) for s in WATCHLIST if get_price(s)})
 
 
+@app.route('/api/watchlist')
+def api_watchlist():
+    return jsonify(WATCHLIST)
+
+
 @app.route('/api/buy', methods=['POST'])
 def api_buy():
     data = request.json or {}
@@ -387,6 +411,9 @@ def api_buy():
 
     if not symbol or shares <= 0:
         return jsonify({'error': 'Symbol and positive share count required'}), 400
+
+    if symbol not in APPROVED_SYMBOLS:
+        return jsonify({'error': f'{symbol} is not on the approved watchlist'}), 400
 
     price = get_price(symbol) or fetch_price_now(symbol)
     if not price:

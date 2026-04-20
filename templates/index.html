@@ -221,7 +221,7 @@
         <!-- Quick symbols -->
         <div style="margin-top:14px; padding-top:14px; border-top:1px solid var(--border);">
           <div style="font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.05em; margin-bottom:8px;">Watchlist</div>
-          <div style="display:flex; flex-wrap:wrap; gap:5px;" id="watchlistChips"></div>
+          <div style="display:flex; flex-wrap:wrap; gap:5px; max-height:80px; overflow-y:auto;" id="watchlistChips"></div>
         </div>
       </div>
 
@@ -280,16 +280,18 @@
   window.addEventListener('resize', applyLayout);
 
   // ── Watchlist chips ──────────────────────────────────────────────────────
-  const WATCHLIST = ['AAPL','MSFT','GOOGL','AMZN','TSLA','NVDA','META','AMD','NFLX','SPY'];
-  const chips = document.getElementById('watchlistChips');
-  WATCHLIST.forEach(sym => {
-    const btn = document.createElement('button');
-    btn.textContent = sym;
-    btn.style.cssText = 'background:#1a1a1a; border:1px solid #2a2a2a; color:#94a3b8; border-radius:6px; padding:3px 9px; font-size:11px; cursor:pointer; transition:background .1s;';
-    btn.onmouseover = () => btn.style.background = '#222222';
-    btn.onmouseout = () => btn.style.background = '#1a1a1a';
-    btn.onclick = () => { document.getElementById('tradeSymbol').value = sym; };
-    chips.appendChild(btn);
+  // Load watchlist from API and build chips
+  fetch('/api/watchlist').then(r => r.json()).then(list => {
+    const chips = document.getElementById('watchlistChips');
+    list.forEach(sym => {
+      const btn = document.createElement('button');
+      btn.textContent = sym;
+      btn.style.cssText = 'background:#1a1a1a; border:1px solid #2a2a2a; color:#94a3b8; border-radius:6px; padding:3px 9px; font-size:11px; cursor:pointer; transition:background .1s;';
+      btn.onmouseover = () => btn.style.background = '#222222';
+      btn.onmouseout = () => btn.style.background = '#1a1a1a';
+      btn.onclick = () => { document.getElementById('tradeSymbol').value = sym; };
+      chips.appendChild(btn);
+    });
   });
 
   // ── Chart ────────────────────────────────────────────────────────────────
