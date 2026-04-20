@@ -33,8 +33,10 @@ _prices_ready = False  # True once first fetch completes
 # ---------------------------------------------------------------------------
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')   # concurrent reads while bot writes
+    conn.execute('PRAGMA synchronous=NORMAL')
     return conn
 
 
@@ -192,76 +194,86 @@ def trading_bot():
                 time.sleep(30)
                 continue
 
+            now = time.time()
+
+            # --- Read phase (short lock) ---
             with _db_lock:
                 conn = get_db()
-                row = conn.execute('SELECT strategy FROM settings WHERE id = 1').fetchone()
-                strategy = row['strategy'] if row else 'safe'
-                cfg = STRATEGIES.get(strategy, STRATEGIES['safe'])
-                now = time.time()
+                strategy = (conn.execute('SELECT strategy FROM settings WHERE id = 1').fetchone() or {}).get('strategy', 'safe')
+                bal = conn.execute('SELECT balance FROM portfolio WHERE id = 1').fetchone()['balance']
+                positions_db = {r['symbol']: dict(r) for r in conn.execute('SELECT * FROM positions').fetchall()}
+                n_pos = len(positions_db)
+                pval = portfolio_value(conn)
+                conn.close()
 
-                for symbol in WATCHLIST:
-                    if now - _last_trade.get(symbol, 0) < cfg['interval']:
-                        continue
+            cfg = STRATEGIES.get(strategy, STRATEGIES['safe'])
 
-                    price = get_price(symbol)
-                    if not price:
-                        continue
+            # --- Decision phase (no lock) ---
+            actions = []
+            for symbol in WATCHLIST:
+                if now - _last_trade.get(symbol, 0) < cfg['interval']:
+                    continue
+                price = get_price(symbol)
+                if not price:
+                    continue
+                ma = _ma_cache.get(symbol)
+                signal = ((price - ma) / ma) if ma else random.uniform(-0.01, 0.01)
+                pos = positions_db.get(symbol)
+                trade_val = pval * cfg['position_pct']
 
-                    ma = _ma_cache.get(symbol)
-                    signal = ((price - ma) / ma) if ma else random.uniform(-0.01, 0.01)
+                if signal > cfg['threshold'] and pos is None and n_pos < cfg['max_pos']:
+                    shares = round(trade_val / price, 4)
+                    cost = shares * price
+                    if cost <= bal and shares > 0:
+                        actions.append(('BUY', symbol, shares, price, cost, None))
+                        bal -= cost
+                        n_pos += 1
 
-                    bal = conn.execute('SELECT balance FROM portfolio WHERE id = 1').fetchone()['balance']
-                    pos = conn.execute('SELECT * FROM positions WHERE symbol = ?', (symbol,)).fetchone()
-                    n_pos = conn.execute('SELECT COUNT(DISTINCT symbol) FROM positions').fetchone()[0]
+                elif signal < -cfg['threshold'] and pos is not None:
+                    shares = pos['shares']
+                    proceeds = shares * price
+                    pnl = proceeds - shares * pos['avg_price']
+                    actions.append(('SELL', symbol, shares, price, proceeds, pnl))
+                    bal += proceeds
+                    n_pos -= 1
 
+            # --- Write phase (short lock, only if there's something to write) ---
+            if actions:
+                with _db_lock:
+                    conn = get_db()
                     ts = datetime.utcnow().isoformat()
-                    pval = portfolio_value(conn)
-                    trade_val = pval * cfg['position_pct']
-
-                    # BUY
-                    if signal > cfg['threshold'] and pos is None and n_pos < cfg['max_pos']:
-                        shares = round(trade_val / price, 4)
-                        cost = shares * price
-                        if cost <= bal and shares > 0:
-                            conn.execute('UPDATE portfolio SET balance = balance - ?, updated_at = ? WHERE id = 1', (cost, ts))
+                    for action, symbol, shares, price, total, pnl in actions:
+                        if action == 'BUY':
+                            conn.execute('UPDATE portfolio SET balance = balance - ?, updated_at = ? WHERE id = 1', (total, ts))
                             conn.execute(
                                 'INSERT INTO positions (symbol, shares, avg_price, created_at) VALUES (?, ?, ?, ?)'
                                 ' ON CONFLICT(symbol) DO UPDATE SET'
                                 ' avg_price = (avg_price * shares + excluded.avg_price * excluded.shares) / (shares + excluded.shares),'
                                 ' shares = shares + excluded.shares',
                                 (symbol, shares, price, ts))
-                            conn.execute(
-                                'INSERT INTO trades (symbol, action, shares, price, total, pnl, timestamp)'
-                                ' VALUES (?, "BUY", ?, ?, ?, NULL, ?)',
-                                (symbol, shares, price, cost, ts))
-                            conn.commit()
-                            _last_trade[symbol] = now
-                            print(f'BUY  {symbol}: {shares:.4f} @ ${price:.2f}  signal={signal:.4f}')
-
-                    # SELL
-                    elif signal < -cfg['threshold'] and pos is not None:
-                        shares = pos['shares']
-                        proceeds = shares * price
-                        pnl = proceeds - shares * pos['avg_price']
-                        conn.execute('UPDATE portfolio SET balance = balance + ?, updated_at = ? WHERE id = 1', (proceeds, ts))
-                        conn.execute('DELETE FROM positions WHERE symbol = ?', (symbol,))
-                        conn.execute(
-                            'INSERT INTO trades (symbol, action, shares, price, total, pnl, timestamp)'
-                            ' VALUES (?, "SELL", ?, ?, ?, ?, ?)',
-                            (symbol, shares, price, proceeds, pnl, ts))
-                        conn.commit()
+                            conn.execute('INSERT INTO trades (symbol, action, shares, price, total, pnl, timestamp) VALUES (?, "BUY", ?, ?, ?, NULL, ?)',
+                                         (symbol, shares, price, total, ts))
+                            print(f'BUY  {symbol}: {shares:.4f} @ ${price:.2f}')
+                        else:
+                            conn.execute('UPDATE portfolio SET balance = balance + ?, updated_at = ? WHERE id = 1', (total, ts))
+                            conn.execute('DELETE FROM positions WHERE symbol = ?', (symbol,))
+                            conn.execute('INSERT INTO trades (symbol, action, shares, price, total, pnl, timestamp) VALUES (?, "SELL", ?, ?, ?, ?, ?)',
+                                         (symbol, shares, price, total, pnl, ts))
+                            print(f'SELL {symbol}: {shares:.4f} @ ${price:.2f}  pnl=${pnl:.2f}')
                         _last_trade[symbol] = now
-                        print(f'SELL {symbol}: {shares:.4f} @ ${price:.2f}  pnl=${pnl:.2f}')
+                    conn.commit()
+                    conn.close()
 
-                # Equity snapshot every 30 s
-                if now - _last_equity_rec >= 30:
+            # --- Equity snapshot every 30 s (short lock) ---
+            if now - _last_equity_rec >= 30:
+                with _db_lock:
+                    conn = get_db()
                     pval = portfolio_value(conn)
                     conn.execute('INSERT INTO equity_history (value, timestamp) VALUES (?, ?)',
                                  (pval, datetime.utcnow().isoformat()))
                     conn.commit()
-                    _last_equity_rec = now
-
-                conn.close()
+                    conn.close()
+                _last_equity_rec = now
 
         except Exception as e:
             print(f'Bot error: {e}')
