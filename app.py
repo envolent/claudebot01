@@ -131,6 +131,23 @@ def get_price(symbol):
     return _price_cache.get(symbol)
 
 
+def fetch_price_now(symbol):
+    """Fetch a single symbol price immediately (used for manual trades)."""
+    import requests
+    try:
+        url = f'https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}&fields=regularMarketPrice'
+        r = requests.get(url, headers=_YF_HEADERS, timeout=10)
+        result = r.json().get('quoteResponse', {}).get('result', [])
+        if result:
+            p = result[0].get('regularMarketPrice')
+            if p:
+                _price_cache[symbol] = float(p)
+                return float(p)
+    except Exception as e:
+        print(f"fetch_price_now error {symbol}: {e}")
+    return _price_cache.get(symbol)
+
+
 def _price_refresh_loop():
     """Refresh current prices every 60 s; MAs are fetched once on startup."""
     while True:
@@ -255,6 +272,12 @@ def api_portfolio():
         conn = get_db()
         bal = conn.execute('SELECT balance FROM portfolio WHERE id = 1').fetchone()['balance']
         rows = conn.execute('SELECT * FROM positions').fetchall()
+        first_rec = conn.execute('SELECT timestamp FROM equity_history ORDER BY timestamp ASC LIMIT 1').fetchone()
+        today_str = datetime.utcnow().strftime('%Y-%m-%d')
+        today_start_rec = conn.execute(
+            "SELECT value FROM equity_history WHERE timestamp LIKE ? ORDER BY timestamp ASC LIMIT 1",
+            (today_str + '%',)
+        ).fetchone()
         conn.close()
 
     positions, pos_val, total_pnl = [], 0, 0
@@ -278,6 +301,17 @@ def api_portfolio():
     total = bal + pos_val
     ret = (total - STARTING_BALANCE) / STARTING_BALANCE * 100
 
+    # Day counter (capped at 30)
+    if first_rec:
+        start_dt = datetime.fromisoformat(first_rec['timestamp'])
+        day_number = min(30, max(1, (datetime.utcnow() - start_dt).days + 1))
+    else:
+        day_number = 1
+
+    # Today's P&L %
+    today_start_val = today_start_rec['value'] if today_start_rec else STARTING_BALANCE
+    today_pnl_pct = (total - today_start_val) / today_start_val * 100 if today_start_val > 0 else 0
+
     return jsonify({
         'balance': round(bal, 2),
         'total_value': round(total, 2),
@@ -285,6 +319,8 @@ def api_portfolio():
         'total_pnl': round(total_pnl, 2),
         'total_return': round(ret, 2),
         'positions': positions,
+        'day_number': day_number,
+        'today_pnl_pct': round(today_pnl_pct, 2),
     })
 
 
@@ -326,7 +362,7 @@ def api_buy():
     if not symbol or shares <= 0:
         return jsonify({'error': 'Symbol and positive share count required'}), 400
 
-    price = get_price(symbol)
+    price = get_price(symbol) or fetch_price_now(symbol)
     if not price:
         return jsonify({'error': f'Could not fetch price for {symbol}'}), 400
 

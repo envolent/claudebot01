@@ -114,11 +114,33 @@
     </div>
   </nav>
 
-  <!-- ── Ticker Bar ────────────────────────────────────────────── -->
-  <div id="tickerBar"
-       style="background:var(--surface); border-bottom:1px solid var(--border);
-              overflow-x:auto; white-space:nowrap; padding:6px 20px; font-size:11px; color:var(--text-muted);">
-    <span style="color:var(--text-dim);">Fetching prices…</span>
+  <!-- ── 30-Day Progress Bar ──────────────────────────────────── -->
+  <div style="background:var(--surface); border-bottom:1px solid var(--border); padding:10px 20px;">
+    <div style="max-width:1400px; margin:0 auto; display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+      <!-- Day counter -->
+      <div style="display:flex; align-items:baseline; gap:5px; flex-shrink:0;">
+        <span style="font-size:22px; font-weight:800; color:#fff;" id="dayNum">1</span>
+        <span style="font-size:11px; color:var(--text-muted);">/ 30 days</span>
+      </div>
+      <!-- Progress bar track -->
+      <div style="flex:1; min-width:120px;">
+        <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
+          <span style="font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:.05em;">Progress to 30-day goal</span>
+          <span style="font-size:10px; color:var(--text-muted);">Goal: <span style="color:#4ade80;">+2–4% / day</span></span>
+        </div>
+        <div style="height:6px; background:#1f1f1f; border-radius:99px; overflow:hidden; position:relative;">
+          <!-- Day fill (gray) -->
+          <div id="dayBar" style="position:absolute; left:0; top:0; height:100%; background:#2a2a2a; border-radius:99px; transition:width .4s;"></div>
+          <!-- P&L fill (green/red) -->
+          <div id="pnlBar" style="position:absolute; left:0; top:0; height:100%; background:#22c55e; border-radius:99px; transition:width .4s; opacity:0.9;"></div>
+        </div>
+      </div>
+      <!-- Today's P&L -->
+      <div style="flex-shrink:0; text-align:right;">
+        <div style="font-size:10px; color:var(--text-muted); margin-bottom:2px;">Today</div>
+        <div id="todayPnl" style="font-size:16px; font-weight:700; color:#4ade80;">+0.00%</div>
+      </div>
+    </div>
   </div>
 
   <!-- ── Main ──────────────────────────────────────────────────── -->
@@ -164,7 +186,7 @@
             <span id="chartPts" style="color:var(--text-dim);">0 pts</span>
           </div>
         </div>
-        <div style="height:220px; position:relative;">
+        <div style="height:280px; position:relative;">
           <canvas id="equityChart"></canvas>
         </div>
       </div>
@@ -272,7 +294,7 @@
 
   // ── Chart ────────────────────────────────────────────────────────────────
   const ctx = document.getElementById('equityChart').getContext('2d');
-  const grad = ctx.createLinearGradient(0, 0, 0, 220);
+  const grad = ctx.createLinearGradient(0, 0, 0, 280);
   grad.addColorStop(0, 'rgba(6,182,212,0.25)');
   grad.addColorStop(1, 'rgba(6,182,212,0)');
 
@@ -334,15 +356,19 @@
       },
       scales: {
         x: {
-          grid: { color: 'rgba(30,30,30,0.8)', drawBorder: false },
-          ticks: { color: '#3a3a3a', maxTicksLimit: 7, font: { size: 10 }, maxRotation: 0 },
+          grid: { display: false },
+          border: { display: false },
+          ticks: { color: '#3a3a3a', maxTicksLimit: 6, font: { size: 10 }, maxRotation: 0 },
         },
         y: {
-          grid: { color: 'rgba(30,30,30,0.8)', drawBorder: false },
+          grid: { display: false },
+          border: { display: false },
           ticks: {
-            color: '#3a3a3a', font: { size: 10 },
+            color: '#4b5563', font: { size: 10 },
             callback: v => '$' + v.toLocaleString(),
           },
+          min: 9500,
+          max: 10500,
         },
       },
     },
@@ -363,6 +389,19 @@
   function renderPortfolio(d) {
     const pnl = d.total_pnl, ret = d.total_return;
     const c = colorOf(pnl);
+
+    // Progress bar
+    const day = d.day_number || 1;
+    const todayPct = d.today_pnl_pct || 0;
+    $('dayNum').textContent = day;
+    $('dayBar').style.width = ((day / 30) * 100) + '%';
+    // Goal bar: 3% daily = 100% fill; cap at 100%
+    const goalFill = Math.min(100, Math.max(0, (todayPct / 3) * 100));
+    $('pnlBar').style.width = goalFill + '%';
+    $('pnlBar').style.background = todayPct >= 0 ? '#22c55e' : '#ef4444';
+    const todayEl = $('todayPnl');
+    todayEl.textContent = (todayPct >= 0 ? '+' : '') + todayPct.toFixed(2) + '%';
+    todayEl.style.color = todayPct >= 2 ? '#4ade80' : todayPct >= 0 ? '#facc15' : '#f87171';
 
     $('statTotal').textContent = fmtMoney(d.total_value);
     $('statCash').textContent = fmtMoney(d.balance);
@@ -435,10 +474,13 @@
     chart.data.labels = labels;
     chart.data.datasets[0].data = values;
     chart.data.datasets[1].data = history.map(() => 10000);
-    const mn = Math.min(...values, 10000), mx = Math.max(...values, 10000);
-    const pad = (mx - mn) * 0.12 || 150;
-    chart.options.scales.y.min = mn - pad;
-    chart.options.scales.y.max = mx + pad;
+    // Always keep scale relative to $10k so chart feels meaningful
+    const mn = Math.min(...values, 10000);
+    const mx = Math.max(...values, 10000);
+    const spread = Math.max(mx - mn, 200);
+    const pad = spread * 0.25;
+    chart.options.scales.y.min = Math.floor((mn - pad) / 100) * 100;
+    chart.options.scales.y.max = Math.ceil((mx + pad) / 100) * 100;
     chart.update('none');
     $('chartPts').textContent = `${values.length} pts`;
   }
@@ -458,16 +500,14 @@
   // ── API calls ────────────────────────────────────────────────────────────
   async function fetchAll() {
     try {
-      const [port, trades, equity, prices] = await Promise.all([
+      const [port, trades, equity] = await Promise.all([
         fetch('/api/portfolio').then(r => r.json()),
         fetch('/api/trades?limit=50').then(r => r.json()),
         fetch('/api/equity?limit=200').then(r => r.json()),
-        fetch('/api/prices').then(r => r.json()),
       ]);
       renderPortfolio(port);
       renderTrades(trades);
       renderChart(equity);
-      renderTicker(prices);
     } catch (e) {
       console.error('Poll error:', e);
     }
