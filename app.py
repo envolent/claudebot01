@@ -84,62 +84,55 @@ def init_db():
 
 
 # ---------------------------------------------------------------------------
-# Price fetching — bulk refresh in background, zero blocking in request path
+# Price fetching — direct Yahoo Finance JSON, no pandas/numpy
 # ---------------------------------------------------------------------------
 
+_YF_HEADERS = {'User-Agent': 'Mozilla/5.0'}
+
 def _refresh_prices():
-    """Fetch all watchlist prices + MAs in one bulk yf.download call."""
+    """Single HTTP call for all symbols → fills _price_cache and _ma_cache."""
     global _prices_ready
+    import requests
+
+    # -- Current prices (quotes endpoint, all symbols at once) --
     try:
-        import yfinance as yf
-        # Single bulk download for current prices (1-min bars, today)
-        raw = yf.download(
-            WATCHLIST, period='1d', interval='1m',
-            group_by='ticker', progress=False, auto_adjust=True, threads=True
-        )
-        for sym in WATCHLIST:
-            try:
-                col = raw[sym]['Close'] if len(WATCHLIST) > 1 else raw['Close']
-                col = col.dropna()
-                if not col.empty:
-                    _price_cache[sym] = float(col.iloc[-1])
-            except Exception:
-                pass
-
-        # Daily data for 10-day MA (one bulk call)
-        daily = yf.download(
-            WATCHLIST, period='20d', interval='1d',
-            group_by='ticker', progress=False, auto_adjust=True, threads=True
-        )
-        for sym in WATCHLIST:
-            try:
-                col = daily[sym]['Close'] if len(WATCHLIST) > 1 else daily['Close']
-                col = col.dropna()
-                if len(col) >= 10:
-                    _ma_cache[sym] = float(col.tail(10).mean())
-            except Exception:
-                pass
-
+        symbols_csv = ','.join(WATCHLIST)
+        url = f'https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols_csv}&fields=regularMarketPrice'
+        r = requests.get(url, headers=_YF_HEADERS, timeout=15)
+        for q in r.json().get('quoteResponse', {}).get('result', []):
+            sym = q.get('symbol')
+            p = q.get('regularMarketPrice')
+            if sym and p:
+                _price_cache[sym] = float(p)
         _prices_ready = True
-        print(f"Prices refreshed: {list(_price_cache.keys())}")
+        print(f"Prices: { {k: round(v,2) for k,v in _price_cache.items()} }")
     except Exception as e:
-        print(f"Price refresh error: {e}")
-        # Apply tiny random walk to keep cached prices alive
-        for sym in list(_price_cache.keys()):
+        print(f"Quote fetch error: {e}")
+        # Random walk on existing cache so stale prices drift realistically
+        for sym in list(_price_cache):
             _price_cache[sym] *= (1 + random.gauss(0, 0.0003))
+
+    # -- 10-day MA (one chart call per symbol, only if MA not cached yet) --
+    for sym in WATCHLIST:
+        if sym in _ma_cache:
+            continue
+        try:
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=20d'
+            r = requests.get(url, headers=_YF_HEADERS, timeout=10)
+            closes = r.json()['chart']['result'][0]['indicators']['quote'][0]['close']
+            closes = [c for c in closes if c is not None]
+            if len(closes) >= 10:
+                _ma_cache[sym] = sum(closes[-10:]) / 10
+        except Exception as e:
+            print(f"MA fetch error {sym}: {e}")
 
 
 def get_price(symbol):
-    """Return cached price instantly — never blocks on network."""
     return _price_cache.get(symbol)
 
 
-def get_ma(symbol):
-    return _ma_cache.get(symbol)
-
-
 def _price_refresh_loop():
-    """Background thread: refresh every 60 s."""
+    """Refresh current prices every 60 s; MAs are fetched once on startup."""
     while True:
         _refresh_prices()
         time.sleep(60)
