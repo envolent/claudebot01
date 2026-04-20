@@ -4,6 +4,7 @@ import threading
 import time
 import random
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request, render_template
 
 app = Flask(__name__)
@@ -173,12 +174,24 @@ def portfolio_value(conn):
 _last_trade = {}       # symbol -> unix timestamp
 _last_equity_rec = 0   # unix timestamp
 
+_PT = ZoneInfo('America/Los_Angeles')
+
+def is_market_open():
+    now_pt = datetime.now(_PT)
+    if now_pt.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    return 6 <= now_pt.hour < 13       # 6:00 AM – 1:00 PM PT
+
 
 def trading_bot():
     global _last_equity_rec
     print('Trading bot started')
     while True:
         try:
+            if not is_market_open():
+                time.sleep(30)
+                continue
+
             with _db_lock:
                 conn = get_db()
                 row = conn.execute('SELECT strategy FROM settings WHERE id = 1').fetchone()
@@ -321,6 +334,7 @@ def api_portfolio():
         'positions': positions,
         'day_number': day_number,
         'today_pnl_pct': round(today_pnl_pct, 2),
+        'market_open': is_market_open(),
     })
 
 

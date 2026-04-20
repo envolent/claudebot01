@@ -94,7 +94,7 @@
         <div class="font-bold text-white text-sm">ClaudeBot 01</div>
         <div style="color:var(--text-muted); font-size:10px;">Paper Trading Dashboard</div>
       </div>
-      <span id="botBadge" class="badge-green hidden sm:inline-block">● Bot Active</span>
+      <span id="botBadge" class="badge-green hidden sm:inline-block">● Market Open</span>
     </div>
     <div class="flex items-center gap-2">
       <span style="color:var(--text-muted); font-size:12px;" class="hidden sm:inline">Strategy</span>
@@ -389,6 +389,16 @@
   function renderPortfolio(d) {
     const pnl = d.total_pnl, ret = d.total_return;
     const c = colorOf(pnl);
+
+    // Market open badge
+    const badge = $('botBadge');
+    if (d.market_open) {
+      badge.textContent = '● Market Open';
+      badge.className = 'badge-green hidden sm:inline-block';
+    } else {
+      badge.textContent = '● Market Closed';
+      badge.style.cssText = 'background:rgba(100,116,139,0.15); border:1px solid rgba(100,116,139,0.3); color:#64748b; border-radius:999px; padding:2px 10px; font-size:11px; font-weight:600;';
+    }
 
     // Progress bar
     const day = d.day_number || 1;
