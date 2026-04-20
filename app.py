@@ -12,26 +12,57 @@ app = Flask(__name__)
 DB_PATH = os.environ.get('DB_PATH', 'trading.db')
 STARTING_BALANCE = 10000.0
 
-WATCHLIST = [
-    # Mega-cap tech
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA',
-    # Mid-cap tech & semis
-    'AMD', 'INTC', 'QCOM', 'ADBE', 'CRM', 'ORCL', 'NFLX',
-    # Finance
-    'JPM', 'BAC', 'GS', 'V', 'MA',
-    # Healthcare
-    'JNJ', 'UNH', 'PFE', 'ABBV', 'MRK',
-    # Consumer
-    'WMT', 'COST', 'MCD', 'SBUX', 'NKE',
-    # Energy
-    'XOM', 'CVX',
-    # Industrial
-    'CAT', 'BA', 'HON',
-    # ETFs (broad market)
-    'SPY', 'QQQ', 'IWM',
+PENNY_STOCK_MIN = 5.0  # SEC definition: under $5 = penny stock
+
+# S&P 500 fallback used until dynamic fetch succeeds
+_SP500_FALLBACK = [
+    'AAPL','MSFT','GOOGL','AMZN','META','NVDA','TSLA','BRK-B','JPM','V',
+    'UNH','XOM','MA','JNJ','PG','HD','CVX','MRK','ABBV','PEP','KO','LLY',
+    'AVGO','COST','MCD','WMT','BAC','TMO','CSCO','ACN','ABT','CRM','DHR',
+    'ADBE','NKE','TXN','WFC','PM','NEE','RTX','BMY','AMGN','QCOM','HON',
+    'SBUX','T','LOW','GE','ELV','INTC','AMD','INTU','MDT','GILD','CAT',
+    'SPGI','GS','BLK','AXP','ISRG','C','VRTX','REGN','CVS','SYK','ZTS',
+    'ADI','BKNG','MO','MDLZ','CI','PYPL','TGT','CB','SO','DUK','MMM',
+    'ETN','PLD','NOC','LMT','F','GM','USB','TFC','MS','SCHW','ITW',
+    'AON','MCO','CME','ICE','NSC','UNP','DE','EMR','APD','ECL','FDX',
+    'SPY','QQQ','IWM','DIA','GLD',
 ]
 
-PENNY_STOCK_MIN = 5.0  # SEC definition: under $5 = penny stock
+WATCHLIST = list(_SP500_FALLBACK)  # replaced at runtime by _load_sp500()
+
+
+def _load_sp500():
+    """Fetch current S&P 500 tickers from Wikipedia. Falls back to hardcoded list."""
+    global WATCHLIST
+    try:
+        import requests
+        r = requests.get(
+            'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies',
+            headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+        # Parse the first table's Symbol column
+        symbols = []
+        in_table = False
+        for line in r.text.splitlines():
+            if '<table class="wikitable' in line:
+                in_table = True
+            if in_table and '<td>' in line and '</td>' in line:
+                cell = line.strip().replace('<td>', '').replace('</td>', '').replace('\n', '')
+                # Symbol cells contain a link: <td><a ...>AAPL</a></td>
+                if '<a' in cell:
+                    import re
+                    m = re.search(r'>([A-Z]{1,5}(?:\.[A-Z])?)<', cell)
+                    if m:
+                        sym = m.group(1).replace('.', '-')
+                        symbols.append(sym)
+                        if len(symbols) >= 505:
+                            break
+        if len(symbols) > 100:
+            WATCHLIST = symbols
+            print(f'Loaded {len(WATCHLIST)} S&P 500 symbols')
+        else:
+            print(f'S&P 500 parse got only {len(symbols)} symbols, keeping fallback')
+    except Exception as e:
+        print(f'S&P 500 load error: {e} — using fallback list')
 
 STRATEGIES = {
     'ultra_safe':       {'interval': 120, 'position_pct': 0.02, 'max_pos': 3,  'threshold': 0.025, 'label': 'Ultra Safe'},
@@ -111,33 +142,41 @@ def init_db():
 
 _YF_HEADERS = {'User-Agent': 'Mozilla/5.0'}
 
-def _refresh_prices():
-    """Single HTTP call for all symbols → fills _price_cache and _ma_cache."""
-    global _prices_ready
+def _fetch_quotes_batch(symbols):
+    """Fetch current prices for up to 100 symbols in one call."""
     import requests
-
-    # -- Current prices (quotes endpoint, all symbols at once) --
     try:
-        symbols_csv = ','.join(WATCHLIST)
-        url = f'https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols_csv}&fields=regularMarketPrice'
+        csv = ','.join(symbols)
+        url = f'https://query1.finance.yahoo.com/v7/finance/quote?symbols={csv}&fields=regularMarketPrice'
         r = requests.get(url, headers=_YF_HEADERS, timeout=15)
         for q in r.json().get('quoteResponse', {}).get('result', []):
             sym = q.get('symbol')
             p = q.get('regularMarketPrice')
-            if sym and p:
+            if sym and p and float(p) >= PENNY_STOCK_MIN:
                 _price_cache[sym] = float(p)
-        _prices_ready = True
-        print(f"Prices: { {k: round(v,2) for k,v in _price_cache.items()} }")
     except Exception as e:
-        print(f"Quote fetch error: {e}")
-        # Random walk on existing cache so stale prices drift realistically
+        print(f'Quote batch error: {e}')
+
+
+def _refresh_prices():
+    """Refresh all prices in 100-symbol batches."""
+    global _prices_ready
+    symbols = list(WATCHLIST)
+    # Batch into groups of 100 (Yahoo Finance limit per request)
+    for i in range(0, len(symbols), 100):
+        _fetch_quotes_batch(symbols[i:i+100])
+    if _price_cache:
+        _prices_ready = True
+        print(f'Prices refreshed for {len(_price_cache)} symbols')
+    else:
+        # Random walk fallback
         for sym in list(_price_cache):
             _price_cache[sym] *= (1 + random.gauss(0, 0.0003))
 
-    # -- 10-day MA (one chart call per symbol, only if MA not cached yet) --
-    for sym in WATCHLIST:
-        if sym in _ma_cache:
-            continue
+    # -- 10-day MA: only fetch for symbols not yet cached --
+    import requests
+    missing_ma = [s for s in symbols if s not in _ma_cache]
+    for sym in missing_ma[:20]:  # max 20 per refresh cycle to avoid hammering
         try:
             url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=20d'
             r = requests.get(url, headers=_YF_HEADERS, timeout=10)
@@ -146,7 +185,7 @@ def _refresh_prices():
             if len(closes) >= 10:
                 _ma_cache[sym] = sum(closes[-10:]) / 10
         except Exception as e:
-            print(f"MA fetch error {sym}: {e}")
+            print(f'MA fetch error {sym}: {e}')
 
 
 def get_price(symbol):
@@ -530,7 +569,7 @@ def api_reset():
 # ---------------------------------------------------------------------------
 
 init_db()
-# Price refresher starts first so cache is warm before bot needs it
+_load_sp500()
 _pricer = threading.Thread(target=_price_refresh_loop, daemon=True)
 _pricer.start()
 _bot = threading.Thread(target=trading_bot, daemon=True)
