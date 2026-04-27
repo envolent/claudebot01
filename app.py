@@ -161,43 +161,21 @@ _yf_host_idx = 0  # alternate between hosts to reduce blocking
 
 
 def _fetch_quotes_batch(symbols):
-    """Fetch prices via Yahoo Finance (alternating hosts) with Finnhub fallback."""
+    """Fetch prices — Finnhub primary, Yahoo Finance fallback."""
     global _yf_host_idx
     import requests
 
     finnhub_key = os.environ.get('FINNHUB_API_KEY', '')
 
-    # --- Try Yahoo Finance ---
-    try:
-        host = _YF_HOSTS[_yf_host_idx % len(_YF_HOSTS)]
-        _yf_host_idx += 1
-        csv = ','.join(symbols)
-        url = (f'https://{host}/v7/finance/quote'
-               f'?symbols={csv}&fields=regularMarketPrice,regularMarketChangePercent')
-        r = requests.get(url, headers=_YF_HEADERS, timeout=10)
-        results = r.json().get('quoteResponse', {}).get('result', [])
-        if results:
-            for q in results:
-                sym = q.get('symbol')
-                p   = q.get('regularMarketPrice')
-                chg = q.get('regularMarketChangePercent')
-                if sym and p and float(p) >= PENNY_STOCK_MIN:
-                    _price_cache[sym] = float(p)
-                    if chg is not None:
-                        _change_cache[sym] = float(chg) / 100
-            return  # success — no need for fallback
-    except Exception as e:
-        print(f'YF batch error: {e}')
-
-    # --- Finnhub fallback (if API key set) ---
+    # --- Finnhub (primary) ---
     if finnhub_key:
         for sym in symbols:
             try:
                 url = f'https://finnhub.io/api/v1/quote?symbol={sym}&token={finnhub_key}'
                 r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
                 d = r.json()
-                p   = d.get('c')   # current price
-                pc  = d.get('pc')  # previous close
+                p  = d.get('c')   # current price
+                pc = d.get('pc')  # previous close
                 if p and float(p) >= PENNY_STOCK_MIN:
                     _price_cache[sym] = float(p)
                     if pc and float(pc) > 0:
@@ -206,7 +184,25 @@ def _fetch_quotes_batch(symbols):
                 print(f'Finnhub error {sym}: {e}')
         return
 
-    print('No price data source available — set FINNHUB_API_KEY as fallback')
+    # --- Yahoo Finance fallback ---
+    try:
+        host = _YF_HOSTS[_yf_host_idx % len(_YF_HOSTS)]
+        _yf_host_idx += 1
+        csv = ','.join(symbols)
+        url = (f'https://{host}/v7/finance/quote'
+               f'?symbols={csv}&fields=regularMarketPrice,regularMarketChangePercent')
+        r = requests.get(url, headers=_YF_HEADERS, timeout=10)
+        results = r.json().get('quoteResponse', {}).get('result', [])
+        for q in results:
+            sym = q.get('symbol')
+            p   = q.get('regularMarketPrice')
+            chg = q.get('regularMarketChangePercent')
+            if sym and p and float(p) >= PENNY_STOCK_MIN:
+                _price_cache[sym] = float(p)
+                if chg is not None:
+                    _change_cache[sym] = float(chg) / 100
+    except Exception as e:
+        print(f'YF batch error: {e}')
 
 
 def _refresh_prices():
@@ -247,8 +243,19 @@ def get_price(symbol):
 
 
 def fetch_price_now(symbol):
-    """Fetch a single symbol price immediately (used for manual trades + Claude validation)."""
+    """Fetch a single symbol price immediately — Finnhub primary, Yahoo fallback."""
     import requests
+    finnhub_key = os.environ.get('FINNHUB_API_KEY', '')
+    if finnhub_key:
+        try:
+            url = f'https://finnhub.io/api/v1/quote?symbol={symbol}&token={finnhub_key}'
+            r = requests.get(url, timeout=5)
+            p = r.json().get('c')
+            if p and float(p) > 0:
+                _price_cache[symbol] = float(p)
+                return float(p)
+        except Exception as e:
+            print(f'Finnhub fetch_price_now error {symbol}: {e}')
     for host in _YF_HOSTS:
         try:
             url = f'https://{host}/v7/finance/quote?symbols={symbol}&fields=regularMarketPrice'
@@ -261,18 +268,6 @@ def fetch_price_now(symbol):
                     return float(p)
         except Exception:
             pass
-    # Finnhub fallback
-    finnhub_key = os.environ.get('FINNHUB_API_KEY', '')
-    if finnhub_key:
-        try:
-            url = f'https://finnhub.io/api/v1/quote?symbol={symbol}&token={finnhub_key}'
-            r = requests.get(url, timeout=5)
-            p = r.json().get('c')
-            if p and float(p) > 0:
-                _price_cache[symbol] = float(p)
-                return float(p)
-        except Exception as e:
-            print(f'Finnhub fetch_price_now error {symbol}: {e}')
     return _price_cache.get(symbol)
 
 
