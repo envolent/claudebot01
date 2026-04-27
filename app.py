@@ -242,6 +242,45 @@ def get_price(symbol):
     return _price_cache.get(symbol)
 
 
+_earnings_cache = {'data': [], 'date': ''}
+
+def fetch_earnings_this_week():
+    """Fetch this week's earnings calendar from Finnhub. Cached for the day."""
+    import requests
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    if _earnings_cache['date'] == today:
+        return _earnings_cache['data']
+
+    finnhub_key = os.environ.get('FINNHUB_API_KEY', '')
+    if not finnhub_key:
+        return []
+
+    try:
+        now = datetime.utcnow()
+        # Monday to Friday of current week
+        mon = now - __import__('datetime').timedelta(days=now.weekday())
+        fri = mon + __import__('datetime').timedelta(days=4)
+        from_str = mon.strftime('%Y-%m-%d')
+        to_str   = fri.strftime('%Y-%m-%d')
+        url = f'https://finnhub.io/api/v1/calendar/earnings?from={from_str}&to={to_str}&token={finnhub_key}'
+        r = requests.get(url, timeout=8)
+        items = r.json().get('earningsCalendar', [])
+        # Keep only S&P 500 symbols we know about
+        known = set(WATCHLIST)
+        earnings = [
+            {'symbol': e['symbol'], 'date': e['date'],
+             'epsEstimate': e.get('epsEstimate'), 'revenueEstimate': e.get('revenueEstimate')}
+            for e in items if e.get('symbol') in known
+        ]
+        _earnings_cache['data'] = earnings
+        _earnings_cache['date'] = today
+        print(f'Earnings this week: {len(earnings)} companies')
+        return earnings
+    except Exception as e:
+        print(f'Earnings fetch error: {e}')
+        return []
+
+
 def fetch_price_now(symbol):
     """Fetch a single symbol price immediately — Finnhub primary, Yahoo fallback."""
     import requests
@@ -332,6 +371,20 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         pnl = (cur - p['avg_price']) * p['shares']
         pos_lines.append(f"  {sym}: {p['shares']:.4f} sh @ ${p['avg_price']:.2f}, now ${cur:.2f}, P&L ${pnl:+.2f}")
 
+    # Earnings this week
+    earnings = fetch_earnings_this_week()
+    today_str = datetime.utcnow().strftime('%Y-%m-%d')
+    earnings_today   = [e for e in earnings if e['date'] == today_str]
+    earnings_week    = [e for e in earnings if e['date'] != today_str]
+    def _fmt_earning(e):
+        eps = f", EPS est ${e['epsEstimate']}" if e.get('epsEstimate') else ''
+        return f"  {e['symbol']} on {e['date']}{eps}"
+    earnings_lines = []
+    if earnings_today:
+        earnings_lines.append('  REPORTING TODAY: ' + ', '.join(e['symbol'] for e in earnings_today))
+    if earnings_week:
+        earnings_lines += [_fmt_earning(e) for e in earnings_week[:15]]
+
     max_pos = cfg['max_pos']
     pos_pct = cfg['position_pct']
 
@@ -344,6 +397,8 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         f"  Trades left today: {remaining}\n\n"
         f"CURRENT POSITIONS:\n" + ("\n".join(pos_lines) if pos_lines else "  None") + "\n\n"
         f"AVAILABLE STOCKS:\n" + "\n".join(mover_lines) + "\n\n"
+        f"EARNINGS THIS WEEK (high volatility opportunities):\n" +
+        ("\n".join(earnings_lines) if earnings_lines else "  None reported") + "\n\n"
         f"RULES:\n"
         f"  - You MUST buy something if cash > $50 and positions < {max_pos}\n"
         f"  - Max ${MAX_TRADE_VALUE:.0f} per buy order\n"
@@ -351,7 +406,9 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         f"  - Otherwise buy shares = floor({MAX_TRADE_VALUE:.0f} / price)\n"
         f"  - No penny stocks (price must be >= $5)\n"
         f"  - Don't buy a symbol already in positions\n"
-        f"  - Sell positions that are losing >2% or have gained >3%\n\n"
+        f"  - Sell positions that are losing >2% or have gained >3%\n"
+        f"  - Consider buying stocks reporting earnings soon (pre-earnings momentum)\n"
+        f"  - Consider selling stocks that already reported if they disappointed\n\n"
         f"Respond with a JSON array ONLY — no markdown, no explanation:\n"
         f'[{{"action":"BUY","symbol":"NVDA","shares":1}},{{"action":"SELL","symbol":"AAPL","shares":2.5}}]\n'
         f"You MUST include at least 1 trade if cash is available and positions < max."
