@@ -335,7 +335,7 @@ def portfolio_value(conn):
 _last_trade = {}        # symbol -> unix timestamp
 _last_equity_rec = 0    # unix timestamp
 _last_claude_call = 0   # unix timestamp — Claude decides every 10 min
-MIN_HOLD_SECONDS = 1800  # 30 minutes minimum hold before selling
+MIN_HOLD_SECONDS = 172800  # 2 days minimum hold before selling
 
 _PT = ZoneInfo('America/Los_Angeles')
 
@@ -419,9 +419,10 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         f"  - Otherwise buy shares = floor({MAX_TRADE_VALUE:.0f} / price)\n"
         f"  - No penny stocks (price must be >= $5)\n"
         f"  - Don't buy a symbol already in positions\n"
-        f"  - HOLD RULE: Do NOT sell any position held less than 30 minutes\n"
-        f"  - HOLD RULE: Do NOT sell if P&L is between -0.5% and +0.5% (no churn)\n"
-        f"  - Sell only if: held >= 30 min AND (loss > 2% OR gain > 3%)\n"
+        f"  - HOLD RULE: Do NOT sell any position held less than 2 days (48 hours)\n"
+        f"  - HOLD RULE: Do NOT sell if P&L is between -3% and +3% (no churn)\n"
+        f"  - Sell only if: held >= 2 days AND (loss > 5% OR gain > 4%)\n"
+        f"  - Goal is multi-day swing trading — buy and hold for days hoping for a few percent gain\n"
         f"  - Consider buying stocks reporting earnings soon (pre-earnings momentum)\n"
         f"  - Consider selling stocks that already reported if they disappointed\n\n"
         f"Respond with a JSON array ONLY — no markdown, no explanation:\n"
@@ -499,14 +500,14 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
             except Exception:
                 held_secs = 9999
             if held_secs < MIN_HOLD_SECONDS:
-                print(f'HOLD: {symbol} only held {int(held_secs/60)}min, skipping sell')
+                print(f'HOLD: {symbol} only held {int(held_secs/3600):.1f}h, skipping sell')
                 continue
             shares = pos['shares']
             proceeds = shares * price
             pnl = proceeds - shares * pos['avg_price']
             pnl_pct = (pnl / (shares * pos['avg_price'])) * 100 if pos['avg_price'] > 0 else 0
-            # Guard against zero-P&L churn
-            if abs(pnl_pct) < 0.5:
+            # Only exit on a meaningful move (5% loss or 4% gain)
+            if abs(pnl_pct) < 3.0:
                 print(f'HOLD: {symbol} P&L {pnl_pct:.2f}% too small, skipping sell')
                 continue
             actions.append(('SELL', symbol, shares, price, proceeds, pnl))
@@ -583,12 +584,8 @@ def trading_bot():
                 ).fetchone()[0]
                 conn.close()
 
-            if daily_trades >= MAX_DAILY_TRADES:
-                time.sleep(60)
-                continue
-
             cfg = STRATEGIES.get(strategy, STRATEGIES['safe'])
-            remaining = MAX_DAILY_TRADES - daily_trades
+            remaining = cfg['max_pos'] * 2  # buys available this Claude call
 
             # --- Decision phase: Claude AI (every 5 min) or rule-based fallback ---
             actions = []
