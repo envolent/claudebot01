@@ -334,7 +334,8 @@ def portfolio_value(conn):
 
 _last_trade = {}        # symbol -> unix timestamp
 _last_equity_rec = 0    # unix timestamp
-_last_claude_call = 0   # unix timestamp — Claude decides every 5 min
+_last_claude_call = 0   # unix timestamp — Claude decides every 10 min
+MIN_HOLD_SECONDS = 1800  # 30 minutes minimum hold before selling
 
 _PT = ZoneInfo('America/Los_Angeles')
 
@@ -342,7 +343,9 @@ def is_market_open():
     now_pt = datetime.now(_PT)
     if now_pt.weekday() >= 5:          # Saturday=5, Sunday=6
         return False
-    return 6 <= now_pt.hour < 13       # 6:00 AM – 1:00 PM PT
+    open_hour = now_pt.hour >= 6
+    close_hour = now_pt.hour < 13
+    return open_hour and close_hour    # 6:00 AM – 1:00 PM PT Mon–Fri
 
 
 def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
@@ -365,11 +368,21 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         _last_claude_call = time.time()
         return []
 
+    now_ts = time.time()
     pos_lines = []
     for sym, p in positions_db.items():
         cur = get_price(sym) or p['avg_price']
         pnl = (cur - p['avg_price']) * p['shares']
-        pos_lines.append(f"  {sym}: {p['shares']:.4f} sh @ ${p['avg_price']:.2f}, now ${cur:.2f}, P&L ${pnl:+.2f}")
+        pnl_pct = (pnl / (p['shares'] * p['avg_price'])) * 100 if p['avg_price'] > 0 else 0
+        try:
+            held_secs = (datetime.utcnow() - datetime.fromisoformat(p['created_at'])).total_seconds()
+        except Exception:
+            held_secs = 9999
+        held_min = int(held_secs / 60)
+        pos_lines.append(
+            f"  {sym}: {p['shares']:.4f} sh @ ${p['avg_price']:.2f}, now ${cur:.2f}, "
+            f"P&L ${pnl:+.2f} ({pnl_pct:+.1f}%), held {held_min} min"
+        )
 
     # Earnings this week
     earnings = fetch_earnings_this_week()
@@ -400,18 +413,20 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         f"EARNINGS THIS WEEK (high volatility opportunities):\n" +
         ("\n".join(earnings_lines) if earnings_lines else "  None reported") + "\n\n"
         f"RULES:\n"
-        f"  - You MUST buy something if cash > $50 and positions < {max_pos}\n"
+        f"  - Buy if cash > $50 and open positions < {max_pos}\n"
         f"  - Max ${MAX_TRADE_VALUE:.0f} per buy order\n"
-        f"  - If a stock price > ${MAX_TRADE_VALUE:.0f}, buy exactly 1 share\n"
+        f"  - If stock price > ${MAX_TRADE_VALUE:.0f}, buy exactly 1 share\n"
         f"  - Otherwise buy shares = floor({MAX_TRADE_VALUE:.0f} / price)\n"
         f"  - No penny stocks (price must be >= $5)\n"
         f"  - Don't buy a symbol already in positions\n"
-        f"  - Sell positions that are losing >2% or have gained >3%\n"
+        f"  - HOLD RULE: Do NOT sell any position held less than 30 minutes\n"
+        f"  - HOLD RULE: Do NOT sell if P&L is between -0.5% and +0.5% (no churn)\n"
+        f"  - Sell only if: held >= 30 min AND (loss > 2% OR gain > 3%)\n"
         f"  - Consider buying stocks reporting earnings soon (pre-earnings momentum)\n"
         f"  - Consider selling stocks that already reported if they disappointed\n\n"
         f"Respond with a JSON array ONLY — no markdown, no explanation:\n"
         f'[{{"action":"BUY","symbol":"NVDA","shares":1}},{{"action":"SELL","symbol":"AAPL","shares":2.5}}]\n'
-        f"You MUST include at least 1 trade if cash is available and positions < max."
+        f"If no good opportunities exist, return []."
     )
 
     try:
@@ -478,9 +493,22 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
             pos = positions_db.get(symbol)
             if not pos:
                 continue
+            # Enforce minimum hold time
+            try:
+                held_secs = (datetime.utcnow() - datetime.fromisoformat(pos['created_at'])).total_seconds()
+            except Exception:
+                held_secs = 9999
+            if held_secs < MIN_HOLD_SECONDS:
+                print(f'HOLD: {symbol} only held {int(held_secs/60)}min, skipping sell')
+                continue
             shares = pos['shares']
             proceeds = shares * price
             pnl = proceeds - shares * pos['avg_price']
+            pnl_pct = (pnl / (shares * pos['avg_price'])) * 100 if pos['avg_price'] > 0 else 0
+            # Guard against zero-P&L churn
+            if abs(pnl_pct) < 0.5:
+                print(f'HOLD: {symbol} P&L {pnl_pct:.2f}% too small, skipping sell')
+                continue
             actions.append(('SELL', symbol, shares, price, proceeds, pnl))
             cur_bal += proceeds
             cur_n_pos -= 1
@@ -566,7 +594,7 @@ def trading_bot():
             actions = []
             api_key = os.environ.get('ANTHROPIC_API_KEY', '')
 
-            if api_key and now - _last_claude_call >= 120:
+            if api_key and now - _last_claude_call >= 600:
                 actions = _claude_decide(
                     bal, positions_db, n_pos, pval, remaining, cfg)
             elif not api_key:
