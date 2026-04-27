@@ -335,7 +335,7 @@ def portfolio_value(conn):
 _last_trade = {}        # symbol -> unix timestamp
 _last_equity_rec = 0    # unix timestamp
 _last_claude_call = 0   # unix timestamp — Claude decides every 10 min
-MIN_HOLD_SECONDS = 172800  # 2 days minimum hold before selling
+MIN_HOLD_SECONDS = 14400   # 4-hour hard floor to prevent instant flips; Claude decides beyond that
 
 _PT = ZoneInfo('America/Los_Angeles')
 
@@ -419,10 +419,13 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         f"  - Otherwise buy shares = floor({MAX_TRADE_VALUE:.0f} / price)\n"
         f"  - No penny stocks (price must be >= $5)\n"
         f"  - Don't buy a symbol already in positions\n"
-        f"  - HOLD RULE: Do NOT sell any position held less than 2 days (48 hours)\n"
-        f"  - HOLD RULE: Do NOT sell if P&L is between -3% and +3% (no churn)\n"
-        f"  - Sell only if: held >= 2 days AND (loss > 5% OR gain > 4%)\n"
-        f"  - Goal is multi-day swing trading — buy and hold for days hoping for a few percent gain\n"
+        f"  - STRATEGY: Swing trading — buy and hold 2–5 days targeting 3–5% gains\n"
+        f"  - DEFAULT: Hold positions and let the trade breathe. Do not sell just because a stock moved slightly.\n"
+        f"  - SELL when the thesis BREAKS: loss > 5%, MACD turning negative, RSI overbought (>75) near resistance\n"
+        f"  - SELL to TAKE PROFIT: gain > 4% and momentum is stalling or RSI is extended\n"
+        f"  - HOLD even at a small loss if the setup is still intact (price above key MA, MACD still positive)\n"
+        f"  - Use situational judgment: a stock down 2% after 1 day on no news is different from one breaking support\n"
+        f"  - Positions held < 4 hours will be rejected by the system regardless — do not try to sell them\n"
         f"  - Consider buying stocks reporting earnings soon (pre-earnings momentum)\n"
         f"  - Consider selling stocks that already reported if they disappointed\n\n"
         f"Respond with a JSON array ONLY — no markdown, no explanation:\n"
@@ -506,8 +509,8 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
             proceeds = shares * price
             pnl = proceeds - shares * pos['avg_price']
             pnl_pct = (pnl / (shares * pos['avg_price'])) * 100 if pos['avg_price'] > 0 else 0
-            # Only exit on a meaningful move (5% loss or 4% gain)
-            if abs(pnl_pct) < 3.0:
+            # Block trivial exits — Claude should only sell on meaningful moves
+            if abs(pnl_pct) < 1.0:
                 print(f'HOLD: {symbol} P&L {pnl_pct:.2f}% too small, skipping sell')
                 continue
             actions.append(('SELL', symbol, shares, price, proceeds, pnl))
