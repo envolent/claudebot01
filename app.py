@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request, render_template
 
 app = Flask(__name__)
 
-DB_PATH = os.environ.get('DB_PATH', 'trading.db')
+DB_PATH = os.environ.get('DB_PATH', '/opt/render/project/src/trading.db')
 STARTING_BALANCE = 10000.0
 
 PENNY_STOCK_MIN = 5.0  # SEC definition: under $5 = penny stock
@@ -147,56 +147,99 @@ def init_db():
 # Price fetching — direct Yahoo Finance JSON, no pandas/numpy
 # ---------------------------------------------------------------------------
 
-_YF_HEADERS = {'User-Agent': 'Mozilla/5.0'}
+_YF_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Origin': 'https://finance.yahoo.com',
+    'Referer': 'https://finance.yahoo.com/',
+}
+
+_YF_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']
+_yf_host_idx = 0  # alternate between hosts to reduce blocking
+
 
 def _fetch_quotes_batch(symbols):
-    """Fetch current prices + intraday change % for up to 100 symbols in one call."""
+    """Fetch prices via Yahoo Finance (alternating hosts) with Finnhub fallback."""
+    global _yf_host_idx
     import requests
+
+    finnhub_key = os.environ.get('FINNHUB_API_KEY', '')
+
+    # --- Try Yahoo Finance ---
     try:
+        host = _YF_HOSTS[_yf_host_idx % len(_YF_HOSTS)]
+        _yf_host_idx += 1
         csv = ','.join(symbols)
-        url = (f'https://query1.finance.yahoo.com/v7/finance/quote'
+        url = (f'https://{host}/v7/finance/quote'
                f'?symbols={csv}&fields=regularMarketPrice,regularMarketChangePercent')
-        r = requests.get(url, headers=_YF_HEADERS, timeout=15)
-        for q in r.json().get('quoteResponse', {}).get('result', []):
-            sym = q.get('symbol')
-            p   = q.get('regularMarketPrice')
-            chg = q.get('regularMarketChangePercent')
-            if sym and p and float(p) >= PENNY_STOCK_MIN:
-                _price_cache[sym] = float(p)
-                if chg is not None:
-                    _change_cache[sym] = float(chg) / 100  # store as decimal, e.g. 0.015
+        r = requests.get(url, headers=_YF_HEADERS, timeout=10)
+        results = r.json().get('quoteResponse', {}).get('result', [])
+        if results:
+            for q in results:
+                sym = q.get('symbol')
+                p   = q.get('regularMarketPrice')
+                chg = q.get('regularMarketChangePercent')
+                if sym and p and float(p) >= PENNY_STOCK_MIN:
+                    _price_cache[sym] = float(p)
+                    if chg is not None:
+                        _change_cache[sym] = float(chg) / 100
+            return  # success — no need for fallback
     except Exception as e:
-        print(f'Quote batch error: {e}')
+        print(f'YF batch error: {e}')
+
+    # --- Finnhub fallback (if API key set) ---
+    if finnhub_key:
+        for sym in symbols:
+            try:
+                url = f'https://finnhub.io/api/v1/quote?symbol={sym}&token={finnhub_key}'
+                r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+                d = r.json()
+                p   = d.get('c')   # current price
+                pc  = d.get('pc')  # previous close
+                if p and float(p) >= PENNY_STOCK_MIN:
+                    _price_cache[sym] = float(p)
+                    if pc and float(pc) > 0:
+                        _change_cache[sym] = (float(p) - float(pc)) / float(pc)
+            except Exception as e:
+                print(f'Finnhub error {sym}: {e}')
+        return
+
+    print('No price data source available — set FINNHUB_API_KEY as fallback')
 
 
 def _refresh_prices():
-    """Refresh all prices in 100-symbol batches."""
+    """Refresh prices; use Finnhub for individual symbols if Yahoo Finance is blocked."""
     global _prices_ready, _prev_price_cache
-    symbols = list(WATCHLIST)
+    import requests
 
-    # Snapshot previous prices before overwriting
+    symbols = list(WATCHLIST)
     _prev_price_cache = dict(_price_cache)
 
-    # Batch into groups of 100 (Yahoo Finance limit per request)
+    # Fetch in batches of 100 (Yahoo Finance) or individually (Finnhub fallback)
     for i in range(0, len(symbols), 100):
         _fetch_quotes_batch(symbols[i:i+100])
+
     if _price_cache:
         _prices_ready = True
         print(f'Prices refreshed for {len(_price_cache)} symbols')
+    else:
+        print('WARNING: price cache still empty after refresh')
 
-    # -- 10-day MA: fetch 50 per cycle so cache fills in ~10 minutes --
-    import requests
-    missing_ma = [s for s in symbols if s not in _ma_cache]
-    for sym in missing_ma[:50]:
+    # 10-day MA — skip if no prices at all
+    missing_ma = [s for s in symbols if s not in _ma_cache and s in _price_cache]
+    for sym in missing_ma[:30]:
         try:
-            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=20d'
+            host = _YF_HOSTS[_yf_host_idx % len(_YF_HOSTS)]
+            url = f'https://{host}/v8/finance/chart/{sym}?interval=1d&range=20d'
             r = requests.get(url, headers=_YF_HEADERS, timeout=5)
             closes = r.json()['chart']['result'][0]['indicators']['quote'][0]['close']
             closes = [c for c in closes if c is not None]
             if len(closes) >= 10:
                 _ma_cache[sym] = sum(closes[-10:]) / 10
-        except Exception as e:
-            print(f'MA fetch error {sym}: {e}')
+        except Exception:
+            pass
 
 
 def get_price(symbol):
@@ -204,19 +247,32 @@ def get_price(symbol):
 
 
 def fetch_price_now(symbol):
-    """Fetch a single symbol price immediately (used for manual trades)."""
+    """Fetch a single symbol price immediately (used for manual trades + Claude validation)."""
     import requests
-    try:
-        url = f'https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}&fields=regularMarketPrice'
-        r = requests.get(url, headers=_YF_HEADERS, timeout=10)
-        result = r.json().get('quoteResponse', {}).get('result', [])
-        if result:
-            p = result[0].get('regularMarketPrice')
-            if p:
+    for host in _YF_HOSTS:
+        try:
+            url = f'https://{host}/v7/finance/quote?symbols={symbol}&fields=regularMarketPrice'
+            r = requests.get(url, headers=_YF_HEADERS, timeout=8)
+            result = r.json().get('quoteResponse', {}).get('result', [])
+            if result:
+                p = result[0].get('regularMarketPrice')
+                if p:
+                    _price_cache[symbol] = float(p)
+                    return float(p)
+        except Exception:
+            pass
+    # Finnhub fallback
+    finnhub_key = os.environ.get('FINNHUB_API_KEY', '')
+    if finnhub_key:
+        try:
+            url = f'https://finnhub.io/api/v1/quote?symbol={symbol}&token={finnhub_key}'
+            r = requests.get(url, timeout=5)
+            p = r.json().get('c')
+            if p and float(p) > 0:
                 _price_cache[symbol] = float(p)
                 return float(p)
-    except Exception as e:
-        print(f"fetch_price_now error {symbol}: {e}")
+        except Exception as e:
+            print(f'Finnhub fetch_price_now error {symbol}: {e}')
     return _price_cache.get(symbol)
 
 
