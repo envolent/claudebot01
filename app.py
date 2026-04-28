@@ -166,21 +166,28 @@ def _fetch_quotes_batch(symbols):
 
     finnhub_key = os.environ.get('FINNHUB_API_KEY', '')
 
-    # --- Finnhub (primary) ---
+    # --- Finnhub (primary) — parallel fetch ---
     if finnhub_key:
-        for sym in symbols:
-            try:
-                url = f'https://finnhub.io/api/v1/quote?symbol={sym}&token={finnhub_key}'
-                r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-                d = r.json()
-                p  = d.get('c')   # current price
-                pc = d.get('pc')  # previous close
-                if p and float(p) >= PENNY_STOCK_MIN:
-                    _price_cache[sym] = float(p)
-                    if pc and float(pc) > 0:
-                        _change_cache[sym] = (float(p) - float(pc)) / float(pc)
-            except Exception as e:
-                print(f'Finnhub error {sym}: {e}')
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _fetch_one(sym):
+            url = f'https://finnhub.io/api/v1/quote?symbol={sym}&token={finnhub_key}'
+            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            return sym, r.json()
+
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures = {ex.submit(_fetch_one, s): s for s in symbols}
+            for fut in as_completed(futures):
+                try:
+                    sym, d = fut.result()
+                    p  = d.get('c')
+                    pc = d.get('pc')
+                    if p and float(p) >= PENNY_STOCK_MIN:
+                        _price_cache[sym] = float(p)
+                        if pc and float(pc) > 0:
+                            _change_cache[sym] = (float(p) - float(pc)) / float(pc)
+                except Exception as e:
+                    print(f'Finnhub error: {e}')
         return
 
     # --- Yahoo Finance fallback ---
