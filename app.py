@@ -538,7 +538,7 @@ def _rule_decide(bal, positions_db, n_pos, pval, remaining, cfg, now):
             continue
         pos = positions_db.get(symbol)
         if signal > cfg['threshold'] and pos is None and n_pos < cfg['max_pos']:
-            shares = 1.0 if price > MAX_TRADE_VALUE else round(min(pval * cfg['position_pct'], MAX_TRADE_VALUE) / price, 4)
+            shares = round((pval * cfg['position_pct']) / price, 4)
             cost = shares * price
             if cost <= bal and shares > 0:
                 actions.append(('BUY', symbol, shares, price, cost, None))
