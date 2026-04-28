@@ -66,8 +66,7 @@ def _load_sp500():
     except Exception as e:
         print(f'S&P 500 load error: {e} — using fallback list')
 
-MAX_TRADE_VALUE  = 500.0   # max $ per buy order (buy 1 share if price > this)
-MAX_DAILY_TRADES = 25      # bot + manual combined
+MAX_DAILY_TRADES = 25      # bot + manual combined (display only, not enforced in bot)
 
 STRATEGIES = {
     'ultra_safe':       {'interval': 120, 'position_pct': 0.02, 'max_pos': 3,  'threshold': 0.025, 'label': 'Ultra Safe'},
@@ -414,9 +413,7 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         ("\n".join(earnings_lines) if earnings_lines else "  None reported") + "\n\n"
         f"RULES:\n"
         f"  - Buy if cash > $50 and open positions < {max_pos}\n"
-        f"  - Max ${MAX_TRADE_VALUE:.0f} per buy order\n"
-        f"  - If stock price > ${MAX_TRADE_VALUE:.0f}, buy exactly 1 share\n"
-        f"  - Otherwise buy shares = floor({MAX_TRADE_VALUE:.0f} / price)\n"
+        f"  - Size each position at ~{pos_pct*100:.0f}% of total portfolio (${pval * pos_pct:.0f})\n"
         f"  - No penny stocks (price must be >= $5)\n"
         f"  - Don't buy a symbol already in positions\n"
         f"  - STRATEGY: Swing trading — buy and hold 2–5 days targeting 3–5% gains\n"
@@ -480,12 +477,9 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
                 continue
             if shares <= 0:
                 continue
-            # Enforce $500 cap
-            if price <= MAX_TRADE_VALUE:
-                max_shares = round(MAX_TRADE_VALUE / price, 4)
-                shares = min(shares, max_shares)
-            else:
-                shares = 1.0
+            # Cap to strategy position size
+            max_shares = round((pval * pos_pct) / price, 4)
+            shares = min(shares, max_shares)
             cost = shares * price
             if cost > cur_bal or shares <= 0:
                 continue
@@ -770,8 +764,6 @@ def api_buy():
         return jsonify({'error': f'{symbol} is a penny stock (${price:.2f} < $5.00) — not allowed'}), 400
 
     cost = shares * price
-    if price <= MAX_TRADE_VALUE and cost > MAX_TRADE_VALUE:
-        return jsonify({'error': f'Max ${MAX_TRADE_VALUE:.0f} per order (would cost ${cost:.2f})'}), 400
 
     with _db_lock:
         conn = get_db()
