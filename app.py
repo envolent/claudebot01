@@ -11,6 +11,12 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request, render_template, session, redirect, url_for
 import secrets
 
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
+
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 
@@ -106,7 +112,6 @@ _prices_ready = False  # True once first fetch completes
 class _PGConn:
     """Makes psycopg2 behave like sqlite3 for this codebase."""
     def __init__(self, conn):
-        import psycopg2.extras
         self._conn = conn
         self._cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
@@ -151,8 +156,7 @@ class _PGConn:
 
 def get_db():
     db_url = os.environ.get('DATABASE_URL', '')
-    if db_url:
-        import psycopg2
+    if db_url and psycopg2 is not None:
         if db_url.startswith('postgres://'):
             db_url = db_url.replace('postgres://', 'postgresql://', 1)
         conn = psycopg2.connect(db_url, sslmode='require', connect_timeout=10)
