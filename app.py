@@ -155,7 +155,7 @@ def get_db():
         import psycopg2
         if db_url.startswith('postgres://'):
             db_url = db_url.replace('postgres://', 'postgresql://', 1)
-        conn = psycopg2.connect(db_url)
+        conn = psycopg2.connect(db_url, sslmode='require')
         return _PGConn(conn)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -1142,7 +1142,10 @@ def api_reasoning():
 # Startup
 # ---------------------------------------------------------------------------
 
-init_db()
+try:
+    init_db()
+except Exception as e:
+    print(f'DB init error: {e}')
 _load_sp500()
 _pricer = threading.Thread(target=_price_refresh_loop, daemon=True)
 _pricer.start()
