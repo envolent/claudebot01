@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -102,10 +103,63 @@ _prices_ready = False  # True once first fetch completes
 # Database
 # ---------------------------------------------------------------------------
 
+class _PGConn:
+    """Makes psycopg2 behave like sqlite3 for this codebase."""
+    def __init__(self, conn):
+        import psycopg2.extras
+        self._conn = conn
+        self._cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    def execute(self, sql, params=()):
+        sql = sql.replace('?', '%s')
+        if 'INSERT OR IGNORE INTO' in sql:
+            sql = sql.replace('INSERT OR IGNORE INTO', 'INSERT INTO')
+            if 'ON CONFLICT' not in sql:
+                sql += ' ON CONFLICT DO NOTHING'
+        self._cur.execute(sql, params)
+        return self
+
+    def executescript(self, script):
+        script = re.sub(r'INTEGER PRIMARY KEY AUTOINCREMENT', 'SERIAL PRIMARY KEY', script)
+        script = script.replace('"safe"', "'safe'")
+        for stmt in [s.strip() for s in script.split(';') if s.strip()]:
+            self._cur.execute(stmt)
+        return self
+
+    def fetchone(self):
+        try:
+            return self._cur.fetchone()
+        except Exception:
+            return None
+
+    def fetchall(self):
+        try:
+            return self._cur.fetchall() or []
+        except Exception:
+            return []
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        try:
+            self._cur.close()
+            self._conn.close()
+        except Exception:
+            pass
+
+
 def get_db():
+    db_url = os.environ.get('DATABASE_URL', '')
+    if db_url:
+        import psycopg2
+        if db_url.startswith('postgres://'):
+            db_url = db_url.replace('postgres://', 'postgresql://', 1)
+        conn = psycopg2.connect(db_url)
+        return _PGConn(conn)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA journal_mode=WAL')   # concurrent reads while bot writes
+    conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA synchronous=NORMAL')
     return conn
 
@@ -148,9 +202,9 @@ def init_db():
     ''')
     now = datetime.utcnow().isoformat()
     conn.execute('INSERT OR IGNORE INTO portfolio (id, balance, updated_at) VALUES (1, ?, ?)', (STARTING_BALANCE, now))
-    conn.execute('INSERT OR IGNORE INTO settings (id, strategy, updated_at) VALUES (1, "safe", ?)', (now,))
-    row = conn.execute('SELECT COUNT(*) FROM equity_history').fetchone()
-    if row[0] == 0:
+    conn.execute("INSERT OR IGNORE INTO settings (id, strategy, updated_at) VALUES (1, 'safe', ?)", (now,))
+    row = conn.execute('SELECT COUNT(*) as n FROM equity_history').fetchone()
+    if row['n'] == 0:
         conn.execute('INSERT INTO equity_history (value, timestamp) VALUES (?, ?)', (STARTING_BALANCE, now))
     conn.commit()
     conn.close()
@@ -598,8 +652,8 @@ def trading_bot():
                 n_pos = len(positions_db)
                 pval = portfolio_value(conn)
                 daily_trades = conn.execute(
-                    "SELECT COUNT(*) FROM trades WHERE timestamp LIKE ?", (today_str + '%',)
-                ).fetchone()[0]
+                    "SELECT COUNT(*) as n FROM trades WHERE timestamp LIKE ?", (today_str + '%',)
+                ).fetchone()['n']
                 conn.close()
 
             cfg = STRATEGIES.get(strategy, STRATEGIES['safe'])
