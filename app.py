@@ -683,6 +683,7 @@ def login():
                    display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
             .box {{ background: #111; border: 1px solid #222; border-radius: 12px;
                    padding: 40px; width: 320px; text-align: center; }}
+            .logo {{ margin: 0 auto 20px; display: block; }}
             h2 {{ margin: 0 0 8px; font-size: 22px; }}
             p {{ color: #888; font-size: 13px; margin: 0 0 24px; }}
             input {{ width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #333;
@@ -694,6 +695,15 @@ def login():
     </head>
     <body>
         <div class="box">
+            <svg class="logo" width="80" height="80" viewBox="0 0 80 80" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="40" cy="40" r="38" fill="#1c1c1c" stroke="#444" stroke-width="1.5"/>
+                <!-- yin yang -->
+                <path d="M40 2 A38 38 0 0 1 40 78 A19 19 0 0 1 40 40 A19 19 0 0 0 40 2Z" fill="#3d2b1f"/>
+                <circle cx="40" cy="21" r="9.5" fill="#3d2b1f"/>
+                <circle cx="40" cy="59" r="9.5" fill="#1c1c1c"/>
+                <circle cx="40" cy="21" r="3.5" fill="#1c1c1c"/>
+                <circle cx="40" cy="59" r="3.5" fill="#3d2b1f"/>
+            </svg>
             <h2>ClaudeBot01</h2>
             <p>Enter password to continue</p>
             <form method="post">
