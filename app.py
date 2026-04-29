@@ -665,6 +665,11 @@ def trading_bot():
 # Routes
 # ---------------------------------------------------------------------------
 
+@app.route('/health')
+def health():
+    return 'ok', 200
+
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     error = None
