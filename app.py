@@ -13,7 +13,7 @@ import secrets
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 
-SITE_PASSWORD = os.environ.get('SITE_PASSWORD', 'Arcturus2014')
+SITE_PASSWORD = 'Arcturus2014'
 
 
 def login_required(f):
