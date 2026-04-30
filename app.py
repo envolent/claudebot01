@@ -479,22 +479,17 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         f"EARNINGS THIS WEEK (high volatility opportunities):\n" +
         ("\n".join(earnings_lines) if earnings_lines else "  None reported") + "\n\n"
         f"RULES:\n"
-        f"  - Buy if cash > $50 and open positions < {max_pos}\n"
-        f"  - Size each position at ~{pos_pct*100:.0f}% of total portfolio (${pval * pos_pct:.0f})\n"
+        f"  - You MUST issue BUY orders if cash > $50 and open positions < {max_pos}. Do not return [] when slots are available.\n"
+        f"  - Size each position at ~{pos_pct*100:.0f}% of total portfolio (~${pval * pos_pct:.0f} per trade)\n"
+        f"  - Compute shares as: floor(position_dollars / stock_price), minimum 0.0001\n"
         f"  - No penny stocks (price must be >= $5)\n"
         f"  - Don't buy a symbol already in positions\n"
-        f"  - STRATEGY: Swing trading — buy and hold 2–5 days targeting 3–5% gains\n"
-        f"  - DEFAULT: Hold positions and let the trade breathe. Do not sell just because a stock moved slightly.\n"
-        f"  - SELL when the thesis BREAKS: loss > 5%, MACD turning negative, RSI overbought (>75) near resistance\n"
-        f"  - SELL to TAKE PROFIT: gain > 4% and momentum is stalling or RSI is extended\n"
-        f"  - HOLD even at a small loss if the setup is still intact (price above key MA, MACD still positive)\n"
-        f"  - Use situational judgment: a stock down 2% after 1 day on no news is different from one breaking support\n"
-        f"  - Positions held < 4 hours will be rejected by the system regardless — do not try to sell them\n"
-        f"  - Consider buying stocks reporting earnings soon (pre-earnings momentum)\n"
-        f"  - Consider selling stocks that already reported if they disappointed\n\n"
+        f"  - Pick the stocks with the strongest momentum from the available list\n"
+        f"  - SELL only if: loss > 5% OR gain > 4% and momentum stalling OR held > 3 days with flat price\n"
+        f"  - Positions held < 4 hours will be rejected by the system — do not try to sell them\n\n"
         f"Respond with a JSON array ONLY — no markdown, no explanation:\n"
-        f'[{{"action":"BUY","symbol":"NVDA","shares":1}},{{"action":"SELL","symbol":"AAPL","shares":2.5}}]\n'
-        f"If no good opportunities exist, return []."
+        f'[{{"action":"BUY","symbol":"NVDA","shares":0.5}},{{"action":"SELL","symbol":"AAPL","shares":2.5}}]\n'
+        f"Only return [] if all position slots are full AND no sell conditions are met."
     )
 
     try:
@@ -506,14 +501,15 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         )
         _last_claude_call = time.time()
         text = msg.content[0].text.strip()
+        print(f'[CLAUDE] raw: {text[:300]}')
         if text.startswith('```'):
             text = text.split('```')[1]
             if text.startswith('json'):
                 text = text[4:].strip()
         decisions = json.loads(text)
-        print(f'Claude decisions: {decisions}')
+        print(f'[CLAUDE] decisions: {decisions}')
     except Exception as e:
-        print(f'Claude decision error: {e}')
+        print(f'[CLAUDE] error: {e}')
         _last_claude_call = time.time()  # back off even on error
         return []
 
@@ -530,12 +526,15 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
 
         price = get_price(symbol) or fetch_price_now(symbol)
         if not price or price < PENNY_STOCK_MIN:
+            print(f'[CLAUDE] skip {symbol}: no price or penny stock (price={price})')
             continue
 
         if action == 'BUY':
             if cur_n_pos >= max_pos:
+                print(f'[CLAUDE] skip BUY {symbol}: positions full ({cur_n_pos}/{max_pos})')
                 continue
             if symbol in positions_db:
+                print(f'[CLAUDE] skip BUY {symbol}: already held')
                 continue
             raw_shares = d.get('shares', 0)
             try:
@@ -549,6 +548,7 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
             shares = min(shares, max_shares)
             cost = shares * price
             if cost > cur_bal or shares <= 0:
+                print(f'[CLAUDE] skip BUY {symbol}: insufficient funds (cost=${cost:.2f}, bal=${cur_bal:.2f}, shares={shares})')
                 continue
             actions.append(('BUY', symbol, shares, price, cost, None))
             cur_bal -= cost
@@ -624,10 +624,19 @@ def _rule_decide(bal, positions_db, n_pos, pval, remaining, cfg, now):
 def trading_bot():
     global _last_equity_rec
     print('Trading bot started')
+    loop_count = 0
     while True:
         try:
-            if not is_market_open():
-                time.sleep(30)
+            loop_count += 1
+            market = is_market_open()
+
+            # Log status every ~5 minutes regardless of market state
+            if loop_count % 60 == 1:
+                print(f'[BOT] alive — market={market}, prices={len(_price_cache)}, '
+                      f'changes={len(_change_cache)}, since_claude={int(time.time()-_last_claude_call)}s')
+
+            if not market:
+                time.sleep(5)
                 continue
 
             now = time.time()
@@ -651,13 +660,18 @@ def trading_bot():
             cfg = STRATEGIES.get(strategy, STRATEGIES['safe'])
             remaining = cfg['max_pos'] * 2  # buys available this Claude call
 
-            # --- Decision phase: Claude AI (every 5 min) or rule-based fallback ---
+            # --- Decision phase: Claude AI (every 5 min) with rule-based fallback ---
             actions = []
             api_key = os.environ.get('ANTHROPIC_API_KEY', '')
 
             if api_key and now - _last_claude_call >= 300:
-                actions = _claude_decide(
-                    bal, positions_db, n_pos, pval, remaining, cfg)
+                print(f'[BOT] Calling Claude — bal=${bal:.2f}, positions={n_pos}/{cfg["max_pos"]}, '
+                      f'prices={len(_price_cache)}, changes={len(_change_cache)}')
+                actions = _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg)
+                # If Claude returned nothing but there are still open slots, use rule-based
+                if not actions and bal > 50 and n_pos < cfg['max_pos']:
+                    print('[BOT] Claude returned no actions — trying rule-based fallback')
+                    actions = _rule_decide(bal, positions_db, n_pos, pval, remaining, cfg, now)
             elif not api_key:
                 actions = _rule_decide(
                     bal, positions_db, n_pos, pval, remaining, cfg, now)
@@ -1071,6 +1085,21 @@ def api_reasoning():
         print(f'Reasoning error: {e}')
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/bot-status')
+def api_bot_status():
+    now = time.time()
+    return jsonify({
+        'market_open': is_market_open(),
+        'prices_loaded': len(_price_cache),
+        'changes_loaded': len(_change_cache),
+        'ma_loaded': len(_ma_cache),
+        'last_claude_call_secs_ago': int(now - _last_claude_call) if _last_claude_call else None,
+        'next_claude_call_secs': max(0, int(300 - (now - _last_claude_call))) if _last_claude_call else 0,
+        'anthropic_key_set': bool(os.environ.get('ANTHROPIC_API_KEY')),
+        'finnhub_key_set': bool(os.environ.get('FINNHUB_API_KEY')),
+    })
 
 
 # ---------------------------------------------------------------------------
