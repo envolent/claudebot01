@@ -655,7 +655,7 @@ def trading_bot():
             actions = []
             api_key = os.environ.get('ANTHROPIC_API_KEY', '')
 
-            if api_key and now - _last_claude_call >= 600:
+            if api_key and now - _last_claude_call >= 300:
                 actions = _claude_decide(
                     bal, positions_db, n_pos, pval, remaining, cfg)
             elif not api_key:
