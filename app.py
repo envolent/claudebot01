@@ -8,7 +8,7 @@ import json
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from flask import Flask, jsonify, request, render_template, session, redirect, url_for
+from flask import Flask, jsonify, request, render_template
 import secrets
 
 try:
@@ -19,18 +19,6 @@ except ImportError:
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-
-SITE_PASSWORD = 'Arcturus2014'
-
-
-def login_required(f):
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not session.get('authenticated'):
-            return redirect(url_for('login'))
-        return f(*args, **kwargs)
-    return decorated
 
 DB_PATH = os.environ.get('DB_PATH', '/opt/render/project/src/trading.db')
 STARTING_BALANCE = 10000.0
@@ -491,41 +479,37 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
         f"EARNINGS THIS WEEK (high volatility opportunities):\n" +
         ("\n".join(earnings_lines) if earnings_lines else "  None reported") + "\n\n"
         f"RULES:\n"
-        f"  - Buy if cash > $50 and open positions < {max_pos}\n"
-        f"  - Size each position at ~{pos_pct*100:.0f}% of total portfolio (${pval * pos_pct:.0f})\n"
+        f"  - You MUST issue BUY orders if cash > $50 and open positions < {max_pos}. Do not return [] when slots are available.\n"
+        f"  - Size each position at ~{pos_pct*100:.0f}% of total portfolio (~${pval * pos_pct:.0f} per trade)\n"
+        f"  - Compute shares as: floor(position_dollars / stock_price), minimum 0.0001\n"
         f"  - No penny stocks (price must be >= $5)\n"
         f"  - Don't buy a symbol already in positions\n"
-        f"  - STRATEGY: Swing trading — buy and hold 2–5 days targeting 3–5% gains\n"
-        f"  - DEFAULT: Hold positions and let the trade breathe. Do not sell just because a stock moved slightly.\n"
-        f"  - SELL when the thesis BREAKS: loss > 5%, MACD turning negative, RSI overbought (>75) near resistance\n"
-        f"  - SELL to TAKE PROFIT: gain > 4% and momentum is stalling or RSI is extended\n"
-        f"  - HOLD even at a small loss if the setup is still intact (price above key MA, MACD still positive)\n"
-        f"  - Use situational judgment: a stock down 2% after 1 day on no news is different from one breaking support\n"
-        f"  - Positions held < 4 hours will be rejected by the system regardless — do not try to sell them\n"
-        f"  - Consider buying stocks reporting earnings soon (pre-earnings momentum)\n"
-        f"  - Consider selling stocks that already reported if they disappointed\n\n"
+        f"  - Pick the stocks with the strongest momentum from the available list\n"
+        f"  - SELL only if: loss > 5% OR gain > 4% and momentum stalling OR held > 3 days with flat price\n"
+        f"  - Positions held < 4 hours will be rejected by the system — do not try to sell them\n\n"
         f"Respond with a JSON array ONLY — no markdown, no explanation:\n"
-        f'[{{"action":"BUY","symbol":"NVDA","shares":1}},{{"action":"SELL","symbol":"AAPL","shares":2.5}}]\n'
-        f"If no good opportunities exist, return []."
+        f'[{{"action":"BUY","symbol":"NVDA","shares":0.5}},{{"action":"SELL","symbol":"AAPL","shares":2.5}}]\n'
+        f"Only return [] if all position slots are full AND no sell conditions are met."
     )
 
     try:
         client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
         msg = client.messages.create(
-            model='claude-haiku-4-5',
+            model='claude-haiku-4-5-20251001',
             max_tokens=400,
             messages=[{'role': 'user', 'content': prompt}]
         )
         _last_claude_call = time.time()
         text = msg.content[0].text.strip()
+        print(f'[CLAUDE] raw: {text[:300]}')
         if text.startswith('```'):
             text = text.split('```')[1]
             if text.startswith('json'):
                 text = text[4:].strip()
         decisions = json.loads(text)
-        print(f'Claude decisions: {decisions}')
+        print(f'[CLAUDE] decisions: {decisions}')
     except Exception as e:
-        print(f'Claude decision error: {e}')
+        print(f'[CLAUDE] error: {e}')
         _last_claude_call = time.time()  # back off even on error
         return []
 
@@ -542,12 +526,15 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
 
         price = get_price(symbol) or fetch_price_now(symbol)
         if not price or price < PENNY_STOCK_MIN:
+            print(f'[CLAUDE] skip {symbol}: no price or penny stock (price={price})')
             continue
 
         if action == 'BUY':
             if cur_n_pos >= max_pos:
+                print(f'[CLAUDE] skip BUY {symbol}: positions full ({cur_n_pos}/{max_pos})')
                 continue
             if symbol in positions_db:
+                print(f'[CLAUDE] skip BUY {symbol}: already held')
                 continue
             raw_shares = d.get('shares', 0)
             try:
@@ -561,6 +548,7 @@ def _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg):
             shares = min(shares, max_shares)
             cost = shares * price
             if cost > cur_bal or shares <= 0:
+                print(f'[CLAUDE] skip BUY {symbol}: insufficient funds (cost=${cost:.2f}, bal=${cur_bal:.2f}, shares={shares})')
                 continue
             actions.append(('BUY', symbol, shares, price, cost, None))
             cur_bal -= cost
@@ -636,10 +624,19 @@ def _rule_decide(bal, positions_db, n_pos, pval, remaining, cfg, now):
 def trading_bot():
     global _last_equity_rec
     print('Trading bot started')
+    loop_count = 0
     while True:
         try:
-            if not is_market_open():
-                time.sleep(30)
+            loop_count += 1
+            market = is_market_open()
+
+            # Log status every ~5 minutes regardless of market state
+            if loop_count % 60 == 1:
+                print(f'[BOT] alive — market={market}, prices={len(_price_cache)}, '
+                      f'changes={len(_change_cache)}, since_claude={int(time.time()-_last_claude_call)}s')
+
+            if not market:
+                time.sleep(5)
                 continue
 
             now = time.time()
@@ -663,13 +660,18 @@ def trading_bot():
             cfg = STRATEGIES.get(strategy, STRATEGIES['safe'])
             remaining = cfg['max_pos'] * 2  # buys available this Claude call
 
-            # --- Decision phase: Claude AI (every 5 min) or rule-based fallback ---
+            # --- Decision phase: Claude AI (every 5 min) with rule-based fallback ---
             actions = []
             api_key = os.environ.get('ANTHROPIC_API_KEY', '')
 
-            if api_key and now - _last_claude_call >= 600:
-                actions = _claude_decide(
-                    bal, positions_db, n_pos, pval, remaining, cfg)
+            if api_key and now - _last_claude_call >= 300:
+                print(f'[BOT] Calling Claude — bal=${bal:.2f}, positions={n_pos}/{cfg["max_pos"]}, '
+                      f'prices={len(_price_cache)}, changes={len(_change_cache)}')
+                actions = _claude_decide(bal, positions_db, n_pos, pval, remaining, cfg)
+                # If Claude returned nothing but there are still open slots, use rule-based
+                if not actions and bal > 50 and n_pos < cfg['max_pos']:
+                    print('[BOT] Claude returned no actions — trying rule-based fallback')
+                    actions = _rule_decide(bal, positions_db, n_pos, pval, remaining, cfg, now)
             elif not api_key:
                 actions = _rule_decide(
                     bal, positions_db, n_pos, pval, remaining, cfg, now)
@@ -724,60 +726,12 @@ def trading_bot():
 # ---------------------------------------------------------------------------
 
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    error = None
-    if request.method == 'POST':
-        if request.form.get('password') == SITE_PASSWORD:
-            session['authenticated'] = True
-            return redirect(url_for('index'))
-        error = 'Incorrect password'
-    return f'''<!DOCTYPE html>
-<html>
-<head>
-    <title>ClaudeBot01 — Login</title>
-    <style>
-        body {{ background: #0a0a0a; color: #fff; font-family: sans-serif;
-               display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
-        .box {{ background: #111; border: 1px solid #222; border-radius: 12px;
-               padding: 40px; width: 320px; text-align: center; }}
-        h2 {{ margin: 0 0 8px; font-size: 22px; }}
-        p {{ color: #888; font-size: 13px; margin: 0 0 24px; }}
-        input {{ width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #333;
-                background: #1a1a1a; color: #fff; font-size: 15px; box-sizing: border-box; margin-bottom: 12px; }}
-        button {{ width: 100%; padding: 10px; border-radius: 8px; border: none;
-                 background: #2563eb; color: #fff; font-size: 15px; cursor: pointer; }}
-        .error {{ color: #ef4444; font-size: 13px; margin-top: 10px; }}
-    </style>
-</head>
-<body>
-    <div class="box">
-        <h2>ClaudeBot01</h2>
-        <p>Enter password to continue</p>
-        <form method="post">
-            <input type="password" name="password" placeholder="Password" autofocus>
-            <button type="submit">Enter</button>
-        </form>
-        {f'<div class="error">{error}</div>' if error else ''}
-    </div>
-</body>
-</html>'''
-
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
-
-
 @app.route('/')
-@login_required
 def index():
     return render_template('index.html')
 
 
 @app.route('/api/portfolio')
-@login_required
 def api_portfolio():
     with _db_lock:
         conn = get_db()
@@ -842,7 +796,6 @@ def api_portfolio():
 
 
 @app.route('/api/trades')
-@login_required
 def api_trades():
     limit = request.args.get('limit', 50, type=int)
     with _db_lock:
@@ -853,7 +806,6 @@ def api_trades():
 
 
 @app.route('/api/equity')
-@login_required
 def api_equity():
     limit = request.args.get('limit', 200, type=int)
     with _db_lock:
@@ -865,19 +817,16 @@ def api_equity():
 
 
 @app.route('/api/prices')
-@login_required
 def api_prices():
     return jsonify({s: round(get_price(s), 2) for s in WATCHLIST if get_price(s)})
 
 
 @app.route('/api/watchlist')
-@login_required
 def api_watchlist():
     return jsonify(WATCHLIST)
 
 
 @app.route('/api/buy', methods=['POST'])
-@login_required
 def api_buy():
     data = request.json or {}
     symbol = data.get('symbol', '').upper().strip()
@@ -928,7 +877,6 @@ def api_buy():
 
 
 @app.route('/api/sell', methods=['POST'])
-@login_required
 def api_sell():
     data = request.json or {}
     symbol = data.get('symbol', '').upper().strip()
@@ -974,7 +922,6 @@ def api_sell():
 
 
 @app.route('/api/strategy', methods=['GET', 'POST'])
-@login_required
 def api_strategy():
     if request.method == 'POST':
         s = (request.json or {}).get('strategy', '')
@@ -997,7 +944,6 @@ def api_strategy():
 
 
 @app.route('/api/reset', methods=['POST'])
-@login_required
 def api_reset():
     with _db_lock:
         conn = get_db()
@@ -1101,7 +1047,7 @@ def generate_reasoning():
 
     client = anthropic.Anthropic(api_key=api_key)
     message = client.messages.create(
-        model='claude-haiku-4-5',
+        model='claude-haiku-4-5-20251001',
         max_tokens=1500,
         messages=[{'role': 'user', 'content': prompt}]
     )
@@ -1121,7 +1067,6 @@ def generate_reasoning():
 
 
 @app.route('/api/reasoning')
-@login_required
 def api_reasoning():
     force = request.args.get('force', '0') == '1'
     with _reasoning_lock:
@@ -1140,6 +1085,21 @@ def api_reasoning():
         print(f'Reasoning error: {e}')
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/bot-status')
+def api_bot_status():
+    now = time.time()
+    return jsonify({
+        'market_open': is_market_open(),
+        'prices_loaded': len(_price_cache),
+        'changes_loaded': len(_change_cache),
+        'ma_loaded': len(_ma_cache),
+        'last_claude_call_secs_ago': int(now - _last_claude_call) if _last_claude_call else None,
+        'next_claude_call_secs': max(0, int(300 - (now - _last_claude_call))) if _last_claude_call else 0,
+        'anthropic_key_set': bool(os.environ.get('ANTHROPIC_API_KEY')),
+        'finnhub_key_set': bool(os.environ.get('FINNHUB_API_KEY')),
+    })
 
 
 # ---------------------------------------------------------------------------
